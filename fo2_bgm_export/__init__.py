@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export (Car)",
     "author":      "ravenDS",
-    "version":     (1, 5, 4),
+    "version":     (1, 5, 5),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -1251,6 +1251,11 @@ def write_bgm(filepath: str, context, options: dict):
                 if crash_is_temp:
                     temp_meshes.append(crash_work_mesh)
 
+                # make sure the crash mesh's split (loop) normals are available —
+                # these carry the deformation and are read per-vertex below.
+                if hasattr(crash_work_mesh, 'calc_normals_split'):
+                    crash_work_mesh.calc_normals_split()
+
                 crash_mat_world = crash_obj.matrix_world
                 crash_verts = crash_work_mesh.vertices
                 crash_loops = crash_work_mesh.loops
@@ -1266,21 +1271,32 @@ def write_bgm(filepath: str, context, options: dict):
                 same_vert_count = (len(crash_verts) == len(work_mesh.vertices))
 
                 crash_surfaces = []
+
+                def _enc_cn(v):
+                    # FOUC uint8 normal encode: matches pack_fouc_vertex / decode (v/127 - 1)
+                    return max(0, min(255, int(round((v + 1.0) * 127.0))))
+
                 for base_mat_idx, flags, vsize, base_vdata, base_vcount, blender_vis in surface_build_info:
                     crash_vdata = bytearray(base_vdata)
+                    surf_has_normal = is_fouc or bool(flags & VERTEX_NORMAL)
 
                     for buf_idx, (bvi, loop_idx) in enumerate(blender_vis):
                         off = buf_idx * vsize
 
+                        # crash_nrm_src: deformed normal in Blender space, or None to
+                        # keep the base normal already present in crash_vdata.
+                        crash_nrm_src = None
                         if same_loop_count and loop_idx < crash_loop_count:
-                            # primary: use the crash vertex at the same loop position
-                            crash_vi = crash_loops[loop_idx].vertex_index
-                            world_co = crash_mat_world @ crash_verts[crash_vi].co
+                            # primary: crash vertex/loop at the same loop position
+                            crash_loop = crash_loops[loop_idx]
+                            world_co = crash_mat_world @ crash_verts[crash_loop.vertex_index].co
+                            crash_nrm_src = crash_loop.normal
                         elif same_vert_count:
                             # fallback: same vertex count, assume same ordering
                             world_co = crash_mat_world @ crash_verts[bvi].co
+                            crash_nrm_src = crash_verts[bvi].normal
                         else:
-                            # no correspondence — keep base position
+                            # no correspondence — keep base position and base normal
                             world_co = obj.matrix_world @ work_mesh.vertices[bvi].co
 
                         crash_pos = blender_to_fo2_pos(world_co, inv_scale)
@@ -1292,14 +1308,39 @@ def write_bgm(filepath: str, context, options: dict):
                                 M[1][0]*px + M[1][1]*py + M[1][2]*pz + M[1][3],
                                 M[2][0]*px + M[2][1]*py + M[2][2]*pz + M[2][3],
                             )
+
+                        # transform the crash normal exactly like base normals
+                        # (world rotation -> FO2 swap -> local rotation -> clamp)
+                        fo2_cn = None
+                        if surf_has_normal and crash_nrm_src is not None:
+                            cn = (crash_mat_world.to_3x3() @ Vector(crash_nrm_src)).normalized()
+                            fo2_cn = blender_to_fo2_normal(cn)
+                            if fo2_mesh_matrix_inv:
+                                M = fo2_mesh_matrix_inv
+                                nx, ny, nz = fo2_cn
+                                fo2_cn = (
+                                    M[0][0]*nx + M[0][1]*ny + M[0][2]*nz,
+                                    M[1][0]*nx + M[1][1]*ny + M[1][2]*nz,
+                                    M[2][0]*nx + M[2][1]*ny + M[2][2]*nz,
+                                )
+                            fo2_cn = tuple(max(-1.0, min(1.0, c)) for c in fo2_cn)
+
                         if is_fouc:
                             # FOUC: int16 positions at offset 0
                             ix = max(-32767, min(32767, int(round(crash_pos[0] * FOUC_VERTEX_SCALE_INV))))
                             iy = max(-32767, min(32767, int(round(crash_pos[1] * FOUC_VERTEX_SCALE_INV))))
                             iz = max(-32767, min(32767, int(round(crash_pos[2] * FOUC_VERTEX_SCALE_INV))))
                             struct.pack_into('<3h', crash_vdata, off, ix, iy, iz)
+                            if fo2_cn is not None:
+                                # uint8 normal at off+16, order [z, y, x]; pad byte kept
+                                crash_vdata[off + 16] = _enc_cn(fo2_cn[2])
+                                crash_vdata[off + 17] = _enc_cn(fo2_cn[1])
+                                crash_vdata[off + 18] = _enc_cn(fo2_cn[0])
                         else:
                             struct.pack_into('<3f', crash_vdata, off, *crash_pos)
+                            if fo2_cn is not None:
+                                # float normal directly after the 12-byte position
+                                struct.pack_into('<3f', crash_vdata, off + 12, *fo2_cn)
 
                     crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize, base_vcount))
 

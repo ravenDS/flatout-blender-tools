@@ -929,6 +929,32 @@ def extract_crash_vertices(crash_surf: 'CrashSurface', bgm_surf_flags: int) -> l
 
 # BLENDER MESH BUILDER
 
+def _apply_custom_normals(mesh, vert_normals):
+    """Apply per-vertex custom split normals to a freshly validated mesh.
+
+    ``vert_normals`` is parallel to ``mesh.vertices`` (one normal per vertex).
+    Uses the per-vertex API, which assigns each vertex normal to all of that
+    vertex's loops. This is robust to faces/loops that validate() may have
+    removed (validate() never removes vertices, so the parallel arrays stay
+    aligned) and works in Blender 4.2+, where the old ``use_auto_smooth``
+    mechanism no longer exists. Must be called AFTER update()/validate(), and
+    nothing may call update() afterwards or Blender recomputes and discards the
+    custom normals.
+    """
+    if not vert_normals:
+        return
+    n_verts = len(mesh.vertices)
+    if len(vert_normals) != n_verts:
+        # validate() removes faces/loops but never vertices, so the lengths
+        # should always match here. Skip rather than abort the whole import.
+        print("[fo2_bgm_import] skipping custom normals: "
+              f"{len(vert_normals)} normals vs {n_verts} mesh vertices")
+        return
+    mesh.normals_split_custom_set_from_vertices(
+        [(n.x, n.y, n.z) for n in vert_normals]
+    )
+
+
 def build_blender_meshes(context, parser: BGMParser, options: dict):
     """Build Blender mesh objects from parsed BGM data."""
 
@@ -1123,6 +1149,13 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         crash_exports = []
     for (bgm_mesh, surfaces), (_, crash_surface_pairs) in zip(mesh_exports, crash_exports):
         mesh_matrix = fo2_matrix_to_blender(bgm_mesh.matrix)
+        # Normals must transform by the inverse-transpose of the linear part,
+        # not the matrix itself — otherwise any non-uniform scale or shear in
+        # the mesh matrix tilts them off the surface. For pure rotation /
+        # uniform scale this equals mesh_matrix.to_3x3(), so it's a safe
+        # superset of the previous behaviour. axis_matrix is an orthogonal
+        # Y/Z swap (its own inverse-transpose), so it is still applied directly.
+        mesh_normal_matrix = mesh_matrix.to_3x3().inverted_safe().transposed()
 
         # merge all surfaces of this mesh into one Blender mesh
         all_verts = []
@@ -1210,7 +1243,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                 if has_normals:
                     nrm = Vector((v.nx, v.ny, v.nz))
                     if not use_origins:
-                        nrm = mesh_matrix.to_3x3() @ nrm
+                        nrm = mesh_normal_matrix @ nrm
                     nrm = axis_matrix.to_3x3() @ nrm
                     if nrm.length > 0:
                         nrm.normalize()
@@ -1331,31 +1364,20 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                 except Exception:
                     pass
 
-        # update + validate geometry before setting custom normals
+        # update + validate geometry before setting custom normals. validate()
+        # must run BEFORE the normals are applied — running it afterward can
+        # discard the custom normals. verbose reporting (the "Validate Meshes"
+        # option) is folded in here so it happens on this single pre-normals
+        # validate rather than a second pass after the normals.
         bl_mesh.update()
-        bl_mesh.validate()
+        bl_mesh.validate(verbose=validate_meshes)
 
-        # custom split normals — must be set LAST, no update() after or Blender
-        # recalculates and overwrites them
-        if all_normals:
-            loop_normals = []
-            for f in all_faces:
-                for vi in f:
-                    loop_normals.append(all_normals[vi])
-
-            try:
-                bl_mesh.normals_split_custom_set(loop_normals)
-            except Exception:
-                try:
-                    # older Blender (pre-4.1) needed use_auto_smooth=True first
-                    bl_mesh.use_auto_smooth = True
-                    bl_mesh.normals_split_custom_set(loop_normals)
-                except Exception:
-                    pass
+        # custom split normals — must be set LAST, no update()/validate() after
+        # or Blender recalculates and overwrites them. Indexed per vertex
+        # (parallel to the vertex array) so it survives any faces/loops dropped
+        # by validate().
+        _apply_custom_normals(bl_mesh, all_normals)
         # intentionally no bl_mesh.update() here — it would overwrite custom normals
-
-        if validate_meshes:
-            bl_mesh.validate(verbose=True)
 
         # clamp
         if clamp_size > 0:
@@ -1446,7 +1468,7 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
 
                     nrm = Vector((v.nx, v.ny, v.nz))
                     if not use_origins:
-                        nrm = mesh_matrix.to_3x3() @ nrm
+                        nrm = mesh_normal_matrix @ nrm
                     nrm = axis_matrix.to_3x3() @ nrm
                     if nrm.length > 0:
                         nrm.normalize()
@@ -1516,23 +1538,13 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     for i, uv in enumerate(uv_data):
                         uv_layer.data[i].uv = uv
 
-                # update + validate geometry, then set custom normals last (no update after)
+                # update + validate geometry before setting custom normals last
+                # (no update/validate after). verbose folded in like the main mesh.
                 bl_crash_mesh.update()
-                bl_crash_mesh.validate()
+                bl_crash_mesh.validate(verbose=validate_meshes)
 
                 if crash_all_normals:
-                    loop_normals = []
-                    for f in crash_all_faces:
-                        for vi in f:
-                            loop_normals.append(crash_all_normals[vi])
-                    try:
-                        bl_crash_mesh.normals_split_custom_set(loop_normals)
-                    except Exception:
-                        try:
-                            bl_crash_mesh.use_auto_smooth = True
-                            bl_crash_mesh.normals_split_custom_set(loop_normals)
-                        except Exception:
-                            pass
+                    _apply_custom_normals(bl_crash_mesh, crash_all_normals)
                 # intentionally no bl_crash_mesh.update() here
 
                 crash_obj = bpy.data.objects.new(crash_mesh_name, bl_crash_mesh)
