@@ -379,7 +379,7 @@ class IMPORT_OT_fo2_bsa(bpy.types.Operator, ImportHelper):
         for pb in pose_bones:
             pb.rotation_mode = "QUATERNION"
 
-
+        action_name = "fo2_driver_bsa"
         existing = bpy.data.actions.get(action_name)
         if existing is not None:
             bpy.data.actions.remove(existing)
