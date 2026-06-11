@@ -644,12 +644,12 @@ class EXPORT_OT_fo2_bsa(bpy.types.Operator, ExportHelper):
 
 def _menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_fo2_bsa.bl_idname,
-                         text="FO2 Driver Animation (.bsa)")
+                         text="FlatOut Driver Animation (.bsa)")
 
 
 def _menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_fo2_bsa.bl_idname,
-                         text="FO2 Driver Animation (.bsa)")
+                         text="FlatOut Driver Animation (.bsa)")
 
 
 def register():
