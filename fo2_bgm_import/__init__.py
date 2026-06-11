@@ -3,12 +3,12 @@
 # registers the ImportBGM operator and the FlatOut Shader panel.
 
 bl_info = {
-    "name": "FlatOut BGM Import (Car)",
+    "name": "FlatOut BGM Import ",
     "author": "ravenDS",
-    "version": (1, 6, 2),
+    "version": (1, 7, 0),
     "blender": (3, 6, 0),
-    "location": "File > Import > FlatOut Car BGM (.bgm)",
-    "description": "Import FlatOut 1/2/UC BGM car model files",
+    "location": "File > Import > FlatOut BGM (.bgm)",
+    "description": "Import FlatOut 1/2/UC BGM model files",
     "category": "Import-Export",
     "doc_url":     "https://github.com/RavenDS",
     "tracker_url": "https://github.com/RavenDS/flatout-blender-tools/issues",
@@ -56,6 +56,7 @@ from .bgm_xbox import (
 )
 from . import dds2tga as _dds2tga
 from . import dds_normal as _dds_normal
+from . import bgm_driver as _bgm_driver
 
 
 # BODY.INI PARSER
@@ -425,6 +426,34 @@ def build_camera_objects(context, cam_entries: list, root_empty, global_scale: f
     print(f"[camera.ini] Created {len(cam_entries)} cameras under fo2_body_cameras")
 
 
+def _strip_driver_body_scaffolding(context):
+    """Post-import teardown for driver (fo2_driver) BGMs only.
+
+    A driver is a standalone skinned model, so the dummy scaffolding the shared
+    mesh pipeline always builds doesn't apply to it. This removes the
+    'FO2 Body Dummies' collection and everything in it (the 'fo2_body_dummies'
+    empty plus any dummy/object empties).
+
+    The 'fo2_body' root empty is deliberately KEPT: it carries the BGM format
+    flags (bgm_version / bgm_is_fouc / bgm_is_fo1) the export side relies on. The
+    driver mesh, the armature, and the cameras + 'FO2 Body Cameras' collection are
+    all left untouched (the cameras stay parented to fo2_body).
+
+    Done as a teardown rather than by suppressing creation so the shared pipeline
+    stays byte-for-byte identical for every non-driver BGM type.
+    """
+    dummies_coll = bpy.data.collections.get("FO2 Body Dummies")
+    if dummies_coll is None:
+        return
+    # The collection only ever holds empties (the driver mesh is re-parented to
+    # its armature before this runs), so removing its objects is safe.
+    for obj in list(dummies_coll.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    try:
+        bpy.data.collections.remove(dummies_coll)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # BLENDER OPERATOR
 
@@ -498,7 +527,7 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
     )
     use_alpha: BoolProperty(
         name="Import Alpha",
-        default=True,
+        default=False,
         description="Link DDS alpha channel to material transparency. "
                     "Disable for fully opaque import",
     )
@@ -565,6 +594,14 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
                     "create Blender camera objects in a FO2 Body Cameras collection. "
                     "Cameras with a target get a Track To constraint",
     )
+    import_bones_ini: BoolProperty(
+        name="Import Bones (driver)",
+        default=True,
+        description="Auto-detect <filename>_bones.ini next to the BGM file and "
+                    "import the driver skeleton as a Blender armature. Vertex groups "
+                    "are assigned by OBB segment bounding-box testing and an Armature "
+                    "modifier is added to every imported mesh object",
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -604,6 +641,7 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
         box.prop(self, "import_dummies")
         box.prop(self, "import_body_ini")
         box.prop(self, "import_camera_ini")
+        box.prop(self, "import_bones_ini")
 
         # FOUC debug
         box = layout.box()
@@ -636,6 +674,12 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
                 self.report({'ERROR'}, f"Failed to parse BGM file: {filepath}")
                 return {'CANCELLED'}
 
+        # Detect bones.ini early so we can pass skip_dummies_container into options.
+        bgm_dir  = os.path.dirname(filepath)
+        bgm_stem = os.path.splitext(os.path.basename(filepath))[0]
+        bones_ini_path = os.path.join(bgm_dir, bgm_stem + '_bones.ini')
+        is_driver_bgm  = self.import_bones_ini and os.path.isfile(bones_ini_path)
+
         options = {
             'shared_texture_dir': bpy.path.abspath(self.shared_texture_dir) if self.shared_texture_dir else "",
             'crash_dat_path': bpy.path.abspath(self.crash_dat_path) if self.crash_dat_path else "",
@@ -653,6 +697,7 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
             'import_body': self.import_body,
             'import_crash': self.import_crash,
             'import_dummies': self.import_dummies,
+            'skip_dummies_container': is_driver_bgm,
         }
 
         if isinstance(parser, PS2BGMParser):
@@ -711,6 +756,24 @@ class ImportBGM(bpy.types.Operator, ImportHelper):
                         self.report({'INFO'}, f"Imported {len(cam_entries)} cameras from camera.ini")
             else:
                 print(f"[BGM Import] camera.ini not found at {ini_path}, skipping")
+
+        # bones.ini driver skeleton — auto-detected as <stem>_bones.ini
+        if is_driver_bgm:
+            arm_obj = _bgm_driver.import_driver_skeleton(
+                context, objects, bones_ini_path, self.global_scale)
+            if arm_obj:
+                self.report({'INFO'},
+                    f"Imported driver skeleton from "
+                    f"{os.path.basename(bones_ini_path)}")
+            else:
+                self.report({'WARNING'},
+                    f"Driver skeleton import failed for "
+                    f"{os.path.basename(bones_ini_path)}")
+
+        # Driver BGMs don't use the body-rig scaffolding; strip it now so the
+        # shared mesh-build pipeline stays untouched for all other BGM types.
+        if is_driver_bgm:
+            _strip_driver_body_scaffolding(context)
 
         return {'FINISHED'}
 
@@ -967,7 +1030,7 @@ class FO2_PT_ShaderPanel(bpy.types.Panel):
 # REGISTRATION
 
 def menu_func_import(self, context):
-    self.layout.operator(ImportBGM.bl_idname, text="FlatOut Car BGM (.bgm)")
+    self.layout.operator(ImportBGM.bl_idname, text="FlatOut BGM (.bgm)")
 
 
 def register():
