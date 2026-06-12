@@ -771,6 +771,22 @@ def find_crash_root_empty(context):
     return context.scene.objects.get("fo2_body_crash")
 
 
+def _is_collision_or_segment_box(obj):
+    """True for a car-body collision box (fo2_collision_*) or driver ragdoll segment
+    (fo2_segment_* / fo2_driver_segment). These are visualization/metadata boxes and
+    must NEVER be collected as exportable car geometry -- even when the hierarchy
+    add-on's 'View Collisions as Cubes' macro has turned them into real mesh cubes
+    (which are parented to fo2_body / the driver armature, where mesh collection runs).
+    """
+    if obj.name.startswith("fo2_collision_") or obj.name.startswith("fo2_segment_"):
+        return True
+    if obj.get("fo2_driver_segment") is not None:
+        return True
+    if "fo2_min" in obj and "fo2_max" in obj:
+        return True
+    return False
+
+
 def collect_objects_under(root, context):
     """Collect mesh objects and empties parented to *root*.
 
@@ -793,14 +809,15 @@ def collect_objects_under(root, context):
     )
 
     for obj in root.children:
-        if obj.type == 'MESH' and obj.data:
+        if obj.type == 'MESH' and obj.data and not _is_collision_or_segment_box(obj):
             mesh_objects.append(obj)
         elif obj.type == 'EMPTY' and obj != dummies_root:
             # intermediate empties that parent mesh objects (not dummy points)
             has_mesh_child = any(c.type == 'MESH' for c in obj.children)
             if has_mesh_child:
                 for child in obj.children:
-                    if child.type == 'MESH' and child.data:
+                    if (child.type == 'MESH' and child.data
+                            and not _is_collision_or_segment_box(child)):
                         mesh_objects.append(child)
             elif dummies_root is None:
                 # fallback: no fo2_body_dummies — treat direct empty children as dummies
@@ -940,7 +957,8 @@ def write_bgm(filepath: str, context, options: dict):
         driver_arm = _find_driver_armature(context)
         if driver_arm is not None:
             for child in driver_arm.children:
-                if child.type == 'MESH' and child.data:
+                if (child.type == 'MESH' and child.data
+                        and not _is_collision_or_segment_box(child)):
                     mesh_objects.append(child)
 
     if not mesh_objects and not empty_objects:
