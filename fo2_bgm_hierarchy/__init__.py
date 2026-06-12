@@ -24,7 +24,7 @@ Three reorganise operators are available in View3D > Object:
 bl_info = {
     "name":        "FlatOut BGM Hierarchy Reorganiser",
     "author":      "ravenDS",
-    "version":     (1, 3, 3),
+    "version":     (1, 4, 0),
     "blender":     (3, 6, 0),
     "location":    "View3D > Object > FO2: Reorganise",
     "description": "Flatten any scene hierarchy into the layout the BGM exporter expects",
@@ -711,6 +711,124 @@ class FO2_OT_ViewDummiesAsAxes(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# Collision / segment box display  (CUBE empty  <->  real mesh cube)
+
+def _is_collision_box(obj):
+    """True if obj is a car-body collision box (fo2_collision_*) or a driver ragdoll
+    segment (fo2_segment_* / carries the fo2_driver_segment property)."""
+    if obj.name.startswith("fo2_collision_"):
+        return True
+    if obj.name.startswith("fo2_segment_"):
+        return True
+    if obj.get("fo2_driver_segment") is not None:
+        return True
+    return False
+
+
+def _box_cube_mesh(half):
+    """Shared cube mesh datablock spanning +/-half on each local axis. A box's real
+    size comes from the object's scale, so the local cube just mirrors the empty's
+    display (verts at +/-empty_display_size), keeping the box identical in size."""
+    name = "fo2_box_cube_%.4f" % half
+    me = bpy.data.meshes.get(name)
+    if me is not None and len(me.vertices) == 8:
+        return me
+    if me is None:
+        me = bpy.data.meshes.new(name)
+    h = half
+    verts = [(-h, -h, -h), (h, -h, -h), (h, h, -h), (-h, h, -h),
+             (-h, -h,  h), (h, -h,  h), (h, h,  h), (-h, h,  h)]
+    faces = [(0, 1, 2, 3), (4, 7, 6, 5), (0, 4, 5, 1),
+             (1, 5, 6, 2), (2, 6, 7, 3), (3, 7, 4, 0)]
+    me.from_pydata(verts, [], faces)
+    me.update()
+    return me
+
+
+def _transfer_box(src, dst):
+    """Copy transform, parenting, collections, custom properties, colour and display
+    flags between two box objects. Preserves the world transform and, crucially, the
+    rotation_quaternion / rotation_mode the bones.ini exporter reads from segments."""
+    dst.rotation_mode = src.rotation_mode
+    dst.location = src.location.copy()
+    dst.rotation_quaternion = src.rotation_quaternion.copy()
+    dst.rotation_euler = src.rotation_euler.copy()
+    dst.scale = src.scale.copy()
+    dst.color = src.color
+    dst.show_name = src.show_name
+    dst.show_in_front = src.show_in_front
+    for k in src.keys():
+        try:
+            dst[k] = src[k]
+        except Exception:  # noqa: BLE001
+            pass
+    for c in src.users_collection:
+        if dst.name not in c.objects:
+            c.objects.link(dst)
+    dst.parent = src.parent
+    dst.matrix_parent_inverse = src.matrix_parent_inverse.copy()
+
+
+class FO2_OT_ViewCollisionsAsCubes(bpy.types.Operator):
+    """Replace car-body collision boxes & driver ragdoll segment empties with real
+    mesh cubes of identical size, transform and metadata. Fully reversible via
+    'View Collisions as Empties'; does not affect the BGM/bones.ini export"""
+    bl_idname  = "object.fo2_view_collisions_as_cubes"
+    bl_label   = "FO2: View Collisions as Cubes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in list(bpy.data.objects)
+                   if o.type == 'EMPTY' and _is_collision_box(o)]
+        count = 0
+        for e in targets:
+            half = e.empty_display_size or 0.5
+            mesh = _box_cube_mesh(round(half, 4))
+            m = bpy.data.objects.new("__fo2_box_tmp__", mesh)
+            _transfer_box(e, m)
+            m.show_wire = True            # edges visible over the solid box
+            name = e.name
+            bpy.data.objects.remove(e, do_unlink=True)
+            m.name = name                 # reclaim the exact name (no .001 suffix)
+            count += 1
+        self.report({'INFO'},
+                    f"Converted {count} collision/segment box(es) to mesh cubes")
+        return {'FINISHED'}
+
+
+class FO2_OT_ViewCollisionsAsEmpties(bpy.types.Operator):
+    """Convert car-body collision box & driver segment mesh cubes back to
+    CUBE-display empties (reverse of 'View Collisions as Cubes')"""
+    bl_idname  = "object.fo2_view_collisions_as_empties"
+    bl_label   = "FO2: View Collisions as Empties"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        targets = [o for o in list(bpy.data.objects)
+                   if o.type == 'MESH' and _is_collision_box(o)]
+        count = 0
+        for m in targets:
+            half = 0.5
+            if m.data and len(m.data.vertices):
+                half = max((max(abs(c) for c in v.co) for v in m.data.vertices),
+                           default=0.5) or 0.5
+            e = bpy.data.objects.new("__fo2_box_tmp__", None)
+            e.empty_display_type = 'CUBE'
+            e.empty_display_size = half
+            _transfer_box(m, e)
+            name = m.name
+            mesh = m.data
+            bpy.data.objects.remove(m, do_unlink=True)
+            if (mesh is not None and mesh.users == 0
+                    and mesh.name.startswith("fo2_box_cube")):
+                bpy.data.meshes.remove(mesh)
+            e.name = name
+            count += 1
+        self.report({'INFO'},
+                    f"Converted {count} collision/segment box(es) back to empties")
+        return {'FINISHED'}
+
+
 # Registration
 
 def menu_func_object(self, context):
@@ -721,6 +839,9 @@ def menu_func_object(self, context):
     self.layout.separator()
     self.layout.operator(FO2_OT_ViewDummiesAsCubes.bl_idname)
     self.layout.operator(FO2_OT_ViewDummiesAsAxes.bl_idname)
+    self.layout.separator()
+    self.layout.operator(FO2_OT_ViewCollisionsAsCubes.bl_idname)
+    self.layout.operator(FO2_OT_ViewCollisionsAsEmpties.bl_idname)
 
 
 def register():
@@ -729,11 +850,15 @@ def register():
     bpy.utils.register_class(FO2_OT_ReorganiseForFOUC)
     bpy.utils.register_class(FO2_OT_ViewDummiesAsCubes)
     bpy.utils.register_class(FO2_OT_ViewDummiesAsAxes)
+    bpy.utils.register_class(FO2_OT_ViewCollisionsAsCubes)
+    bpy.utils.register_class(FO2_OT_ViewCollisionsAsEmpties)
     bpy.types.VIEW3D_MT_object.append(menu_func_object)
 
 
 def unregister():
     bpy.types.VIEW3D_MT_object.remove(menu_func_object)
+    bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsEmpties)
+    bpy.utils.unregister_class(FO2_OT_ViewCollisionsAsCubes)
     bpy.utils.unregister_class(FO2_OT_ViewDummiesAsAxes)
     bpy.utils.unregister_class(FO2_OT_ViewDummiesAsCubes)
     bpy.utils.unregister_class(FO2_OT_ReorganiseForFOUC)
