@@ -460,6 +460,48 @@ def _import_eject_poses(context, arm_obj, segments, eject_poses, global_scale=1.
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _create_segment_boxes(context, arm_obj, segments, global_scale=1.0):
+    """Materialize each ragdoll segment (OBB) as an editable CUBE-display empty.
+
+    A segment is the physical box a bone owns — Dimension (full extents), Position
+    (centre) and Orientation, in FO2 model space. These are represented the same
+    way the body.ini collision boxes are (CUBE empty, display size 0.5, real extents
+    baked into scale), with the segment's orientation added (segments are oriented,
+    collision boxes were axis-aligned). The empty's transform is exactly the rest
+    OBB, verified to reproduce the FO2 box corners to ~1e-16, so the exporter can
+    read Dimension/Position/Orientation straight back from scale / location /
+    rotation_quaternion via the inverse axis swap. Boxes go in a 'FO2 Driver
+    Segments' collection and are parented to the armature so they stay grouped.
+
+    Returns the number of segment boxes created.
+    """
+    if not segments:
+        return 0
+
+    coll = bpy.data.collections.get("FO2 Driver Segments")
+    if coll is None:
+        coll = bpy.data.collections.new("FO2 Driver Segments")
+        context.scene.collection.children.link(coll)
+
+    count = 0
+    for seg in segments.values():
+        box = bpy.data.objects.new("fo2_segment_" + seg.name, None)
+        box.empty_display_type = 'CUBE'
+        box.empty_display_size = 0.5
+        box.location = _fo2_to_bl(seg.position, global_scale)
+        box.rotation_mode = 'QUATERNION'
+        box.rotation_quaternion = _fo2_quat_to_bl(seg.orientation)
+        box.scale = _fo2_to_bl(seg.dimension, global_scale)
+        box["fo2_driver_segment"] = seg.name
+        box["fo2_driver_segment_index"] = int(seg.bone_index)
+        coll.objects.link(box)
+        box.parent = arm_obj
+        count += 1
+
+    print(f"[Driver] Created {count} segment box(es) in 'FO2 Driver Segments'")
+    return count
+
+
 def import_driver_skeleton(context, mesh_objects, bones_ini_path, global_scale=1.0):
     """Parse bones_ini_path and attach a skeleton to mesh_objects.
 
@@ -517,6 +559,15 @@ def import_driver_skeleton(context, mesh_objects, bones_ini_path, global_scale=1
             c.objects.unlink(arm_obj)
         fo2_body_coll.objects.link(arm_obj)
 
+    # ── Segment (ragdoll OBB) boxes ──
+    # Materialize the Segments block as editable CUBE empties so the data survives
+    # to export time (the exporter needs it to regenerate bones.ini and as the eject
+    # rest-box reference). Additive; never fail the whole import over it.
+    try:
+        _create_segment_boxes(context, arm_obj, segments, global_scale)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Driver] WARNING: segment-box creation failed (non-fatal): {exc}")
+
     # ── Vertex group assignment ──
     if segments:
         bone_vertex_map = _assign_vertices_to_bones(
@@ -548,6 +599,25 @@ def import_driver_skeleton(context, mesh_objects, bones_ini_path, global_scale=1
                                     eject_poses, global_scale)
             print(f"[Driver] Imported {n} eject pose(s) "
                   f"(frame 1 = rest, frames 2..{n + 1} = eject poses)")
+
+            # Back up the eject poses as a flat float array on the armature so they
+            # survive a later .bsa import overwriting the eject-pose action. The
+            # exporter prefers the live 'fo2_driver_eject_poses' action and falls
+            # back to this. Layout: pose-major, one segment per BoneIndex order,
+            # 7 floats each (position xyz + orientation xyzw, FO2 model space);
+            # bones absent from a pose are filled with their rest segment box.
+            seg_order = sorted(segments.values(), key=lambda s: s.bone_index)
+            flat = []
+            for pose in eject_poses:
+                for seg in seg_order:
+                    pos, ori = pose.get(seg.name, (seg.position, seg.orientation))
+                    flat.extend((float(pos[0]), float(pos[1]), float(pos[2]),
+                                 float(ori[0]), float(ori[1]),
+                                 float(ori[2]), float(ori[3])))
+            if flat:
+                arm_obj["fo2_driver_eject_array"] = flat
+                print(f"[Driver] Stored eject backup: {len(eject_poses)} pose(s) × "
+                      f"{len(seg_order)} segment(s) in fo2_driver_eject_array")
     except Exception as exc:
         print(f"[Driver] WARNING: eject pose import failed (non-fatal): {exc}")
 
