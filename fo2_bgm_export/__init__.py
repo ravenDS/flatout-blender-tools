@@ -1,10 +1,10 @@
 bl_info = {
-    "name":        "FlatOut BGM Export (Car)",
+    "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 5, 5),
+    "version":     (1, 6, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
-    "description": "Export FlatOut 1/2/UC car model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
+    "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
     "category":    "Import-Export",
     "doc_url":     "https://github.com/RavenDS",
     "tracker_url": "https://github.com/RavenDS/flatout-blender-tools/issues",
@@ -929,6 +929,20 @@ def write_bgm(filepath: str, context, options: dict):
                 base_name = name[:-6]
                 crash_mesh_map[base_name] = obj
 
+    # Driver case only: the driver mesh ("fo2_driver") is parented to
+    # "fo2_driver_armature", not to fo2_body, so collect_objects_under(fo2_body)
+    # yields no meshes and the export would cancel. When that happens and a driver
+    # armature exists, pull the mesh in from under the armature so the body BGM still
+    # exports. This branch can only trigger for a driver (empty mesh list + armature
+    # present); every other export path is reached with meshes already collected and
+    # is completely unaffected.
+    if not mesh_objects:
+        driver_arm = _find_driver_armature(context)
+        if driver_arm is not None:
+            for child in driver_arm.children:
+                if child.type == 'MESH' and child.data:
+                    mesh_objects.append(child)
+
     if not mesh_objects and not empty_objects:
         print("[BGM Export] ERROR: No objects found under fo2_body!")
         return {'CANCELLED'}
@@ -1522,6 +1536,10 @@ def write_bgm(filepath: str, context, options: dict):
         cam_ini_path = os.path.join(os.path.dirname(filepath), "camera.ini")
         write_camera_ini(cam_ini_path, context, inv_scale)
 
+    # write <name>_bones.ini for a driver export (no-op for non-driver projects)
+    if options.get('export_bones', False):
+        write_bones_ini(filepath, context, inv_scale)
+
     return {'FINISHED'}
 
 
@@ -1773,6 +1791,217 @@ def write_camera_ini(filepath: str, context, inv_scale: float):
     print(f"[BGM Export] Written camera.ini: {filepath} ({len(cam_objs)} cameras)")
 
 
+# DRIVER bones.ini GENERATION
+#
+# Regenerates <name>_bones.ini for a driver export from data the importer leaves in
+# the scene: the driver armature ("fo2_driver_armature") carries fo2_driver_mtb (the
+# per-bone ModelToBone) and an fo2_driver_eject_array backup; the ragdoll segments are
+# the CUBE-display empties tagged fo2_driver_segment. Validated against stock
+# male/female bones.ini: Bones pos/mtb exact, ori ~1.8e-7; Segments exact; eject exact.
+
+def _find_driver_armature(context):
+    """Return the driver armature object, or None if this isn't a driver project."""
+    obj = bpy.data.objects.get("fo2_driver_armature")
+    if obj is not None and obj.type == 'ARMATURE':
+        return obj
+    return None
+
+
+def _collect_segment_boxes():
+    """{bone_name: box_object} for the segment OBB empties (fo2_driver_segment prop)."""
+    boxes = {}
+    for obj in bpy.data.objects:
+        nm = obj.get("fo2_driver_segment")
+        if nm:
+            boxes[nm] = obj
+    return boxes
+
+
+def _bl_quat_to_fo2(q):
+    """mathutils Quaternion (w,x,y,z) -> FO2 orientation (x,y,z,w); inverse of the
+    importer's _fo2_quat_to_bl axis swap."""
+    return (-q.x, -q.z, -q.y, q.w)
+
+
+def _mat3_to_fo2_quat(mat3):
+    """mathutils 3x3 (already in FO2 space) -> FO2 orientation tuple (x,y,z,w)."""
+    q = mat3.to_quaternion()
+    return (q.x, q.y, q.z, q.w)
+
+
+def _fmt3(v):
+    return "{%.5f, %.5f, %.5f}" % (v[0], v[1], v[2])
+
+
+def _fmt4(q):
+    return "{%.8f, %.8f, %.8f, %.8f}" % (q[0], q[1], q[2], q[3])
+
+
+def _eject_poses_from_action(arm, boxes, inv_scale, context):
+    """Read the live 'fo2_driver_eject_poses' action and recover, per eject frame,
+    each segment box's FO2 Position/Orientation by inverting the importer's eject math
+    (t_eject = pose_matrix * matrix_local^-1 * rest_box). Returns a list of
+    {bone_name: (fo2_pos, fo2_ori)} for frames 2..N+1, or None if the action is absent.
+    """
+    action = bpy.data.actions.get("fo2_driver_eject_poses")
+    if action is None:
+        return None
+
+    # rest box (no scale) per bone, armature space = the segment empty's frame
+    rest_box = {}
+    for nm, box in boxes.items():
+        rest_box[nm] = (Matrix.Translation(box.location)
+                        @ box.rotation_quaternion.to_matrix().to_4x4())
+
+    pose_bones = arm.pose.bones
+    fr0, fr1 = action.frame_range
+    first, last = int(round(fr0)), int(round(fr1))
+
+    ad = arm.animation_data or arm.animation_data_create()
+    prev_action = ad.action
+    prev_frame = context.scene.frame_current
+    ad.action = action
+    poses = []
+    try:
+        for f in range(first + 1, last + 1):          # skip frame 1 (rest)
+            context.scene.frame_set(f)
+            context.view_layer.update()
+            pose = {}
+            for nm, box in boxes.items():
+                pb = pose_bones.get(nm)
+                if pb is None:
+                    continue
+                ml = pb.bone.matrix_local
+                t_eject = (pb.matrix @ ml.inverted()) @ rest_box[nm]
+                pos = blender_to_fo2_pos(t_eject.translation, inv_scale)
+                ori = _bl_quat_to_fo2(t_eject.to_quaternion())
+                pose[nm] = (pos, ori)
+            poses.append(pose)
+    finally:
+        ad.action = prev_action
+        context.scene.frame_set(prev_frame)
+    return poses
+
+
+def _eject_poses_from_backup(arm, seg_names):
+    """Decode the fo2_driver_eject_array backup into a list of
+    {bone_name: (fo2_pos, fo2_ori)}. Layout: pose-major, one segment per seg_names
+    entry, 7 floats each (pos xyz + ori xyzw). Returns None if absent/malformed."""
+    flat = arm.get("fo2_driver_eject_array")
+    if not flat:
+        return None
+    flat = [float(v) for v in flat]
+    m = len(seg_names)
+    if m == 0 or len(flat) % (m * 7) != 0:
+        return None
+    npose = len(flat) // (m * 7)
+    poses = []
+    for p in range(npose):
+        pose = {}
+        for j, nm in enumerate(seg_names):
+            o = (p * m + j) * 7
+            pose[nm] = (tuple(flat[o:o + 3]), tuple(flat[o + 3:o + 7]))
+        poses.append(pose)
+    return poses
+
+
+def write_bones_ini(filepath_bgm, context, inv_scale):
+    """Generate <filename>_bones.ini for a driver export. Returns the path or None."""
+    arm = _find_driver_armature(context)
+    if arm is None:
+        return None
+    mtb_prop = arm.get("fo2_driver_mtb")
+    boxes = _collect_segment_boxes()
+    if not mtb_prop or not boxes:
+        print("[BGM Export] bones.ini: no fo2_driver_mtb or segment boxes; skipping")
+        return None
+
+    idx_by = {nm: int(box.get("fo2_driver_segment_index", 0)) for nm, box in boxes.items()}
+    bone_names = sorted(list(mtb_prop.keys()), key=lambda n: idx_by.get(n, 1 << 30))
+    seg_names = sorted(boxes.keys(), key=lambda n: idx_by.get(n, 1 << 30))
+
+    # eject poses: prefer the live action, else the backup array
+    eject = _eject_poses_from_action(arm, boxes, inv_scale, context)
+    src = "action"
+    if eject is None:
+        eject = _eject_poses_from_backup(arm, seg_names)
+        src = "backup"
+    if eject is None:
+        eject = []
+        src = "none"
+
+    L = []
+    L.append("###")
+    L.append("### MakeDriver generated ragdoll script file")
+    L.append("###")
+    L.append("")
+    L.append("")
+
+    # ---- Bones (Position/Orientation derived from ModelToBone, MTB written verbatim)
+    L.append("Bones = {")
+    for nm in bone_names:
+        flat = [float(v) for v in mtb_prop[nm]]
+        mcm = Matrix((flat[0:4], flat[4:8], flat[8:12], flat[12:16])).transposed()
+        bind = mcm.inverted_safe()
+        pos = bind.translation
+        ori = _mat3_to_fo2_quat(bind.to_3x3())
+        L.append("\t-- %s" % nm)
+        L.append("\t[%d] = {" % idx_by.get(nm, 0))
+        L.append("\t\t%-12s=\t%s," % ("Position", _fmt3((pos.x, pos.y, pos.z))))
+        L.append("\t\t%-12s=\t%s," % ("Orientation", _fmt4(ori)))
+        L.append("\t\tModelToBone = {")
+        for r in range(4):
+            L.append("\t\t\t[%d] = { %.5f, %.5f, %.5f, %.5f }," %
+                     (r + 1, flat[r * 4], flat[r * 4 + 1], flat[r * 4 + 2], flat[r * 4 + 3]))
+        L.append("\t\t},")
+        L.append("\t},")
+    L.append("}")
+    L.append("")
+
+    # ---- Segments (Dimension/Position/Orientation read back from the box empties)
+    L.append("Segments = {")
+    for nm in seg_names:
+        box = boxes[nm]
+        dim = blender_to_fo2_pos(box.scale, inv_scale)
+        pos = blender_to_fo2_pos(box.location, inv_scale)
+        ori = _bl_quat_to_fo2(box.rotation_quaternion)
+        L.append("\t%s = {" % nm)
+        L.append("\t\t%-12s=\t%d," % ("BoneIndex", idx_by.get(nm, 0)))
+        L.append("\t\t%-12s=\t%s," % ("Dimension", _fmt3(dim)))
+        L.append("\t\t%-12s=\t%s," % ("Position", _fmt3(pos)))
+        L.append("\t\t%-12s=\t%s," % ("Orientation", _fmt4(ori)))
+        L.append("\t},")
+    L.append("}")
+    L.append("")
+
+    # ---- EjectPoseSegments (Dimension = rest box; Position/Orientation per pose)
+    L.append("EjectPoseSegments = {")
+    for i, pose in enumerate(eject):
+        L.append("\t[%d] = {" % (i + 1))
+        for nm in seg_names:
+            if nm not in pose:
+                continue
+            box = boxes[nm]
+            dim = blender_to_fo2_pos(box.scale, inv_scale)
+            pos, ori = pose[nm]
+            L.append("\t\t%s = {" % nm)
+            L.append("\t\t\t%-12s=\t%d," % ("BoneIndex", idx_by.get(nm, 0)))
+            L.append("\t\t\t%-12s=\t%s," % ("Dimension", _fmt3(dim)))
+            L.append("\t\t\t%-12s=\t%s," % ("Position", _fmt3(pos)))
+            L.append("\t\t\t%-12s=\t%s," % ("Orientation", _fmt4(ori)))
+            L.append("\t\t},")
+        L.append("\t},")
+    L.append("}")
+    L.append("")
+
+    out_path = os.path.splitext(filepath_bgm)[0] + "_bones.ini"
+    with open(out_path, "w", newline="\r\n") as f:
+        f.write("\n".join(L))
+    print("[BGM Export] Wrote %s (%d bones, %d segments, %d eject pose(s), eject=%s)"
+          % (out_path, len(bone_names), len(seg_names), len(eject), src))
+    return out_path
+
+
 # BLENDER OPERATOR
 
 class ExportBGM(bpy.types.Operator, ExportHelper):
@@ -1871,6 +2100,15 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
                     "from Blender camera data and written back to the objects",
     )
 
+    # driver bones.ini
+    export_bones: BoolProperty(
+        name="Export Driver Bones (<name>_bones.ini)",
+        default=False,
+        description="Driver only: regenerate <filename>_bones.ini from the driver "
+                    "armature, its ragdoll segment boxes and eject poses. Enabled "
+                    "only when a 'fo2_driver_armature' is present in the scene",
+    )
+
     def invoke(self, context, event):
         # Auto-detect game mode from fo2_body empty, then fall back to scene property
         root = context.scene.objects.get("fo2_body")
@@ -1880,6 +2118,8 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
             self.game_mode = 'FOUC'
         elif hasattr(context.scene, 'fo2_game_mode'):
             self.game_mode = context.scene.fo2_game_mode
+        # Driver: default-enable bones.ini export only when a driver armature exists.
+        self.export_bones = _find_driver_armature(context) is not None
         return super().invoke(context, event)
 
     def draw(self, context):
@@ -1924,6 +2164,13 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
         box.label(text="Cameras", icon='CAMERA_DATA')
         box.prop(self, "export_camera_ini")
 
+        # driver bones.ini (only meaningful for a driver project)
+        box = layout.box()
+        box.label(text="Driver", icon='ARMATURE_DATA')
+        row = box.row()
+        row.enabled = _find_driver_armature(context) is not None
+        row.prop(self, "export_bones")
+
     def execute(self, context):
         options = {
             'game_mode': self.game_mode,
@@ -1937,6 +2184,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
             'export_body_ini': self.export_body_ini,
             'overwrite_crash_dat': self.overwrite_crash_dat,
             'export_camera_ini': self.export_camera_ini,
+            'export_bones': self.export_bones,
         }
         result = write_bgm(self.filepath, context, options)
         if result == {'CANCELLED'}:
@@ -1950,7 +2198,7 @@ class ExportBGM(bpy.types.Operator, ExportHelper):
 # REGISTRATION
 
 def menu_func_export(self, context):
-    self.layout.operator(ExportBGM.bl_idname, text="FlatOut Car BGM (.bgm)")
+    self.layout.operator(ExportBGM.bl_idname, text="FlatOut BGM (.bgm)")
 
 
 def register():
