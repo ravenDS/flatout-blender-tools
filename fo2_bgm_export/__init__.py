@@ -1561,12 +1561,33 @@ def write_bgm(filepath: str, context, options: dict):
     return {'FINISHED'}
 
 
-def write_body_ini(filepath: str, context, inv_scale: float):
-    """Write body.ini collision boxes from the fo2_collision_* empties in the scene.
+def _box_world_minmax(obj):
+    """World-space axis-aligned (min, max) corner of a collision box from its CURRENT
+    transform/geometry. Collision boxes are axis-aligned, so the world AABB is the box.
+    Works for a CUBE empty (corners at +/-empty_display_size, scaled) and for a real
+    mesh cube (its vertices) alike, so a user resizing/moving either is reflected."""
+    mw = obj.matrix_world
+    if obj.type == 'MESH' and obj.data and len(obj.data.vertices):
+        pts = [mw @ v.co for v in obj.data.vertices]
+    else:
+        d = getattr(obj, "empty_display_size", 0.5) or 0.5
+        pts = [mw @ Vector((sx * d, sy * d, sz * d))
+               for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)]
+    xs = [p.x for p in pts]
+    ys = [p.y for p in pts]
+    zs = [p.z for p in pts]
+    return (Vector((min(xs), min(ys), min(zs))),
+            Vector((max(xs), max(ys), max(zs))))
 
-    Prefers the raw fo2_min/fo2_max custom properties stored on import.
-    Falls back to deriving from the empty's world location and scale if those
-    properties are absent (i.e. the user created the boxes manually).
+
+def write_body_ini(filepath: str, context, inv_scale: float):
+    """Write body.ini collision boxes from the fo2_collision_* boxes in the scene.
+
+    Values are always recomputed from each box's CURRENT transform/geometry, so
+    moving or resizing a box is reflected in the export (the old behaviour preferred
+    the import-time fo2_min/fo2_max custom properties and so wrote stale values after
+    a resize). Works whether the box is a CUBE empty or a mesh cube. The recomputed
+    FO2 values are written back to fo2_min/fo2_max so the cache stays in sync.
     Blender -> FO2 axis: bl(x,y,z) -> fo2(x,z,y)  (y<->z swap, inverse of import).
     """
     box_defs = [
@@ -1579,30 +1600,20 @@ def write_body_ini(filepath: str, context, inv_scale: float):
     found_any = False
 
     for obj_name, key_min, key_max in box_defs:
-        empty = context.scene.objects.get(obj_name)
-        if empty is None:
+        obj = context.scene.objects.get(obj_name)
+        if obj is None:
             print(f"[BGM Export] body.ini: {obj_name} not found, skipping")
             continue
 
-        # prefer stored raw FO2 values (exact round-trip)
-        if "fo2_min" in empty and "fo2_max" in empty:
-            v_min = tuple(empty["fo2_min"])
-            v_max = tuple(empty["fo2_max"])
-        else:
-            # derive from Blender world location + scale
-            # empty_display_size=0.5, scale=dimensions -> half-extents = scale*0.5
-            loc   = empty.matrix_world.translation
-            s     = empty.matrix_world.to_scale()
-            hx, hy, hz = s.x * 0.5, s.y * 0.5, s.z * 0.5
-            # blender -> FO2: x stays, y<->z swap, undo global scale
-            cx = loc.x * inv_scale
-            cy = loc.z * inv_scale   # bl_y in FO2 = bl_z in Blender
-            cz = loc.y * inv_scale   # bl_z in FO2 = bl_y in Blender
-            ex = hx * inv_scale
-            ey = hz * inv_scale
-            ez = hy * inv_scale
-            v_min = (cx - ex, cy - ey, cz - ez)
-            v_max = (cx + ex, cy + ey, cz + ez)
+        # Recompute from the live box so resizes are honoured. Box is axis-aligned;
+        # blender(x,y,z) -> fo2(x,z,y) with the y<->z swap and global scale undone.
+        wmin, wmax = _box_world_minmax(obj)
+        v_min = (wmin.x * inv_scale, wmin.z * inv_scale, wmin.y * inv_scale)
+        v_max = (wmax.x * inv_scale, wmax.z * inv_scale, wmax.y * inv_scale)
+
+        # keep the cached props in sync so they're no longer stale
+        obj["fo2_min"] = list(v_min)
+        obj["fo2_max"] = list(v_max)
 
         def fmt(v):
             return f"{{{v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f}}}"
