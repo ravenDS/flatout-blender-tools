@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 6, 0),
+    "version":     (1, 6, 1),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -547,6 +547,11 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
         elif hasattr(mesh, 'vertex_colors') and len(mesh.vertex_colors) > 0:
             color_attr = mesh.vertex_colors[0]
 
+    # driver skinning: for a driver mesh, the colour channel is 2-bone skin data and is
+    # generated here (None for cars / non-driver meshes -> normal display colour kept).
+    driver_skin = _build_driver_skin_ctx(obj, color_attr, inv_scale) if has_color else None
+    skin_cache = {}
+
     # collect faces for this material
     faces = [p for p in mesh.polygons if p.material_index == mat_index]
     if not faces:
@@ -574,6 +579,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
             # world-space position
             world_co = mat_world @ mesh.vertices[vi].co
             fo2_pos = blender_to_fo2_pos(world_co, inv_scale)
+            fo2_pos_world = fo2_pos   # FO2 world space (segment OBBs live in this space)
 
             # transform to local space if mesh matrix inverse provided
             if fo2_mesh_matrix_inv:
@@ -610,9 +616,29 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                 uv = uv_layer.data[loop_idx].uv
                 fo2_uv = (uv[0], 1.0 - uv[1])  # V flip
 
-            # vertex color (RGBA packed as uint32)
+            # vertex colour, or generated driver skinning for driver meshes
             fo2_color = (255, 255, 255, 255)
-            if has_color and color_attr:
+            if driver_skin is not None:
+                sc = skin_cache.get(vi)
+                if sc is None:
+                    if driver_skin['color_is_skin'] and color_attr:
+                        # imported driver: keep the original skinning bytes verbatim
+                        try:
+                            c = color_attr.data[loop_idx].color
+                            sc = (max(0, min(255, int(c[0] * 255 + 0.5))),
+                                  max(0, min(255, int(c[1] * 255 + 0.5))),
+                                  max(0, min(255, int(c[2] * 255 + 0.5))),
+                                  max(0, min(255, int(c[3] * 255 + 0.5))))
+                        except (IndexError, AttributeError):
+                            sc = _obb_skin_color(driver_skin['segs'], fo2_pos_world)
+                    else:
+                        # weight-painted -> top-2 vertex groups; else segment-OBB blend
+                        sc = _vgroup_skin_color(driver_skin['name2idx'], obj, mesh, vi)
+                        if sc is None:
+                            sc = _obb_skin_color(driver_skin['segs'], fo2_pos_world)
+                    skin_cache[vi] = sc
+                fo2_color = sc
+            elif has_color and color_attr:
                 try:
                     cd = color_attr.data[loop_idx]
                     c = cd.color
@@ -1844,6 +1870,151 @@ def _collect_segment_boxes():
         if nm:
             boxes[nm] = obj
     return boxes
+
+
+# ── DRIVER VERTEX SKINNING ───────────────────────────────────────────────────
+# [bone0, weight0, bone1, weight1] with weight0 + weight1 = 255 (bone indices 0-based)
+# fallback chain: valid skinning color attribute
+#                 -> armature vertex-group weights (weight-painted meshes) 
+#                 -> segment-OBB auto-assignment (replaced meshes, no painting needed)
+
+def _quat_to_matrix_3x3(q):
+    """FO2 quaternion (x, y, z, w) -> 3x3 rotation matrix (row-major list-of-lists)."""
+    x, y, z, w = q
+    return [
+        [1 - 2*(y*y + z*z),  2*(x*y - z*w),      2*(x*z + y*w)],
+        [2*(x*y + z*w),      1 - 2*(x*x + z*z),  2*(y*z - x*w)],
+        [2*(x*z - y*w),      2*(y*z + x*w),      1 - 2*(x*x + y*y)],
+    ]
+
+
+def _point_in_obb_ratio(pt, center, half_ext, rot_mat):
+    """Max normalised penetration of pt inside the OBB: 0=centre, 1=surface, >1=outside.
+    Mirrors the importer's bone-assignment test exactly."""
+    dx = pt[0] - center[0]
+    dy = pt[1] - center[1]
+    dz = pt[2] - center[2]
+    max_ratio = 0.0
+    for axis in range(3):
+        proj = (dx * rot_mat[axis][0] +
+                dy * rot_mat[axis][1] +
+                dz * rot_mat[axis][2])
+        if half_ext[axis] > 1e-9:
+            ratio = abs(proj) / half_ext[axis]
+            if ratio > max_ratio:
+                max_ratio = ratio
+        elif abs(proj) > 1e-6:
+            return 9999.0
+    return max_ratio
+
+
+def _color_attr_is_skinning(color_attr, max_idx):
+    """True if a colour attribute already holds valid skinning (an imported driver):
+    every sampled bone-index byte (R and B) is a real bone index in [0, max_idx].
+    Display colours (e.g. white = 255) fail this and fall through to generated skinning."""
+    if color_attr is None:
+        return False
+    try:
+        data = color_attr.data
+        n = len(data)
+    except (AttributeError, TypeError):
+        return False
+    if n == 0:
+        return False
+    step = 1 if n <= 512 else n // 512
+    seen = 0
+    for i in range(0, n, step):
+        c = data[i].color
+        if int(c[0] * 255 + 0.5) > max_idx or int(c[2] * 255 + 0.5) > max_idx:
+            return False
+        seen += 1
+    return seen > 0
+
+
+def _build_driver_skin_ctx(obj, color_attr, inv_scale):
+    """If obj is a driver mesh (parented to / deformed by fo2_driver_armature), return a
+    skinning context built from the SAME segment OBBs written to bones.ini; else None.
+    ctx = {'segs': [(idx0, center, half, rot), ...], 'name2idx': {...},
+           'color_is_skin': bool}.  idx0 is the 0-based bone index (BoneIndex - 1)."""
+    arm = _find_driver_armature(None)
+    if arm is None:
+        return None
+    is_driver = (obj.parent is arm) or any(
+        m.type == 'ARMATURE' and m.object is arm for m in obj.modifiers)
+    if not is_driver:
+        return None
+    boxes = _collect_segment_boxes()
+    if not boxes:
+        return None
+    segs = []
+    name2idx = {}
+    max_idx = 0
+    for nm, box in boxes.items():
+        idx0 = int(box.get("fo2_driver_segment_index", 0)) - 1   # bones.ini BoneIndex is 1-based
+        if idx0 < 0:
+            continue
+        center = blender_to_fo2_pos(box.location, inv_scale)
+        dim    = blender_to_fo2_pos(box.scale, inv_scale)
+        half   = (abs(dim[0]) * 0.5, abs(dim[1]) * 0.5, abs(dim[2]) * 0.5)
+        rot    = _quat_to_matrix_3x3(_bl_quat_to_fo2(box.rotation_quaternion))
+        segs.append((idx0, center, half, rot))
+        name2idx[nm] = idx0
+        if idx0 > max_idx:
+            max_idx = idx0
+    if not segs:
+        return None
+    return {'segs': segs, 'name2idx': name2idx,
+            'color_is_skin': _color_attr_is_skinning(color_attr, max_idx)}
+
+
+def _obb_skin_color(segs, pt):
+    """2-bone (1 - ratio) blend from the segment OBBs -> (bone0, w0, bone1, w1) bytes.
+    Nearest two OBBs by penetration ratio; weight blends only inside the overlap, so a
+    vertex deep inside one bone binds fully to it. Outside every OBB -> nearest bone."""
+    best0 = (1e18, 0)
+    best1 = (1e18, 0)
+    for idx0, center, half, rot in segs:
+        r = _point_in_obb_ratio(pt, center, half, rot)
+        if r < best0[0]:
+            best1 = best0
+            best0 = (r, idx0)
+        elif r < best1[0]:
+            best1 = (r, idx0)
+    r0, b0 = best0
+    r1, b1 = best1
+    a0 = 1.0 - r0 if r0 < 1.0 else 0.0
+    a1 = 1.0 - r1 if r1 < 1.0 else 0.0
+    if a0 + a1 < 1e-6:
+        w0b = 255                                   # outside every OBB: hard-bind nearest
+    else:
+        w0b = max(0, min(255, int(round(255.0 * a0 / (a0 + a1)))))
+    return (b0, w0b, b1, 255 - w0b)
+
+
+def _vgroup_skin_color(name2idx, obj, mesh, vi):
+    """Top-2 armature vertex-group weights -> (bone0, w0, bone1, w1) bytes, or None if the
+    vertex has no weights mapping to driver bones (then the OBB path is used)."""
+    ws = []
+    vgroups = obj.vertex_groups
+    nvg = len(vgroups)
+    for ge in mesh.vertices[vi].groups:
+        if ge.weight <= 0.0:
+            continue
+        gi = ge.group
+        if 0 <= gi < nvg:
+            idx0 = name2idx.get(vgroups[gi].name)
+            if idx0 is not None:
+                ws.append((ge.weight, idx0))
+    if not ws:
+        return None
+    ws.sort(reverse=True)
+    w0, b0 = ws[0]
+    w1, b1 = ws[1] if len(ws) > 1 else (0.0, b0)
+    tot = w0 + w1
+    if tot <= 0.0:
+        return None
+    w0b = max(0, min(255, int(round(255.0 * w0 / tot))))
+    return (b0, w0b, b1, 255 - w0b)
 
 
 def _bl_quat_to_fo2(q):
