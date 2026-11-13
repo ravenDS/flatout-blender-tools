@@ -1,7 +1,7 @@
 bl_info = {
     "name":        "FlatOut BGM Export",
     "author":      "ravenDS",
-    "version":     (1, 6, 4),
+    "version":     (1, 7, 0),
     "blender":     (3, 6, 0),
     "location":    "File > Export > FlatOut Car BGM (.bgm)",
     "description": "Export FlatOut 1/2/UC model (BGM) files. Based on reverse-egineering work by Chloe (FlatOutW32BGMTool)",
@@ -202,11 +202,21 @@ FOUC_VERTEX_FLAGS = 0x2242
 FOUC_VERTEX_SCALE_INV = 1.0 / FOUC_VERTEX_SCALE  # 1024.0
 
 
-def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv) -> bytes:
+def _enc_fouc_dir(v):
+    """FOUC uint8[4] direction, same scheme as normals: [z, y, x, 0xFF],
+    byte = round((c + 1) * 127), decode (byte / 127) - 1."""
+    def e(c): return max(0, min(255, int(round((c + 1.0) * 127.0))))
+    return (e(v[2]), e(v[1]), e(v[0]), 255)
+
+
+def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv, fo2_tan=None, fo2_bitan=None) -> bytes:
     """Pack a single FOUC vertex (32 bytes).
     fo2_pos: (x,y,z) in FO2 world units
     fo2_nrm: (fo2.x, fo2.y, fo2.z) normalized — FO2 native space
     fo2_uv:  (u,v) 0..1 range
+    fo2_tan / fo2_bitan: tangent frame from compute_fouc_tangent_frames (the
+             normal maps need it). Without one, the legacy 128/128/128 bytes are
+             written, which decode to a ~zero vector: no usable frame.
 
     Buffer normal layout (per tVertexDataFOUC / w32fbxexport.h reference):
       buffer[16] = enc(FO2.z) = enc(fo2_nrm[2])
@@ -229,17 +239,127 @@ def pack_fouc_vertex(fo2_pos, fo2_nrm, fo2_uv) -> bytes:
     UV_SCALE = 2048.0
     u = max(-32767, min(32767, int(round(fo2_uv[0] * UV_SCALE))))
     v = max(-32767, min(32767, int(round(fo2_uv[1] * UV_SCALE))))
+    tan = _enc_fouc_dir(fo2_tan) if fo2_tan is not None else (128, 128, 128, 255)
+    bitan = _enc_fouc_dir(fo2_bitan) if fo2_bitan is not None else (128, 128, 128, 255)
     # pack: int16[3] pos + uint16 pad + uint8[4] tang + uint8[4] bitang +
     #       uint8[4] norm + uint8[4] color + int16[2] UV1 + int16[2] UV2
     return struct.pack('<3hH4B4B4B4B2h2h',
         px, py, pz, 0,
-        128, 128, 128, 255,           # tangents (neutral)
-        128, 128, 128, 255,           # bitangents (neutral)
+        *tan,                         # tangents   [z, y, x, 0xFF]
+        *bitan,                       # bitangents [z, y, x, 0xFF]
         b_nrm0, b_nrm1, b_nrm2, 255, # normals: [z, y, x, pad]
         255, 255, 255, 255,           # vertex color (white)
         u, v,                         # UV1
         0, 0,                         # UV2
     )
+
+
+# FOUC TANGENT FRAMES
+#
+# FOUC vertices carry a tangent and bitangent (bytes 8-15) that orient the
+# normal maps. Calibrated against vanilla FOUC: the frame is the UV
+# derivative frame (tangent = dP/du, bitangent = dP/dv in file UV space),
+# computed per vertex; crash.dat carries the same frame for the crashed shape.
+
+def _fouc_corner_side(p0, p1, p2, uv0, uv1, uv2, n):
+    """+1 / -1: whether the triangle's UV mapping is mirrored relative to the
+    corner normal n. Corners on opposite sides of a UV mirror (or the two faces
+    of two-sided geometry) must not share an exported vertex, because their
+    tangent frames point opposite ways."""
+    e1 = (p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2])
+    e2 = (p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2])
+    det = (uv1[0]-uv0[0])*(uv2[1]-uv0[1]) - (uv2[0]-uv0[0])*(uv1[1]-uv0[1])
+    cx = e1[1]*e2[2] - e1[2]*e2[1]
+    cy = e1[2]*e2[0] - e1[0]*e2[2]
+    cz = e1[0]*e2[1] - e1[1]*e2[0]
+    s = (cx*n[0] + cy*n[1] + cz*n[2]) * det
+    return -1 if s < 0 else 1
+
+
+def compute_fouc_tangent_frames(positions, normals, uvs, tris):
+    """Per-vertex (tangent, bitangent) for a FOUC vertex buffer.
+
+    positions/normals: FO2-space 3-tuples, uvs: file-space (u, v) as written to
+    the buffer, tris: index triples into those lists (any winding).
+
+    Frame = UV derivative frame: tangent along dP/du, bitangent along dP/dv
+    (file V), both in the surface plane. Per triangle the two directions are
+    normalised and accumulated with the corner angle as weight, then the
+    tangent is made perpendicular to the vertex normal and the bitangent is
+    normal x tangent, signed to follow dP/dv (left-handed on mirrored UVs).
+    Matches vanilla FOUC on non-mirrored UVs; vertices with no usable UV
+    gradient get an arbitrary frame perpendicular to the normal.
+    """
+    n = len(positions)
+    acc_t = [[0.0, 0.0, 0.0] for _ in range(n)]
+    acc_b = [[0.0, 0.0, 0.0] for _ in range(n)]
+
+    def _sub(a, b): return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+    def _len(a): return math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])
+
+    for a, b, c in tris:
+        if a == b or b == c or a == c:
+            continue
+        pa, pb, pc = positions[a], positions[b], positions[c]
+        e1, e2 = _sub(pb, pa), _sub(pc, pa)
+        du1, dv1 = uvs[b][0]-uvs[a][0], uvs[b][1]-uvs[a][1]
+        du2, dv2 = uvs[c][0]-uvs[a][0], uvs[c][1]-uvs[a][1]
+        det = du1*dv2 - du2*dv1
+        if abs(det) < 1e-14:
+            continue
+        r = 1.0 / det
+        t = ((e1[0]*dv2 - e2[0]*dv1)*r, (e1[1]*dv2 - e2[1]*dv1)*r, (e1[2]*dv2 - e2[2]*dv1)*r)
+        s = ((e2[0]*du1 - e1[0]*du2)*r, (e2[1]*du1 - e1[1]*du2)*r, (e2[2]*du1 - e1[2]*du2)*r)
+        lt, ls = _len(t), _len(s)
+        if lt < 1e-20 or ls < 1e-20:
+            continue
+        t = (t[0]/lt, t[1]/lt, t[2]/lt)
+        s = (s[0]/ls, s[1]/ls, s[2]/ls)
+        for x, y, z in ((a, b, c), (b, c, a), (c, a, b)):
+            u, w = _sub(positions[y], positions[x]), _sub(positions[z], positions[x])
+            lu, lw = _len(u), _len(w)
+            if lu < 1e-20 or lw < 1e-20:
+                continue
+            cosang = (u[0]*w[0] + u[1]*w[1] + u[2]*w[2]) / (lu*lw)
+            ang = math.acos(max(-1.0, min(1.0, cosang)))
+            at, ab = acc_t[x], acc_b[x]
+            at[0] += t[0]*ang; at[1] += t[1]*ang; at[2] += t[2]*ang
+            ab[0] += s[0]*ang; ab[1] += s[1]*ang; ab[2] += s[2]*ang
+
+    frames = []
+    for i in range(n):
+        nx, ny, nz = normals[i]
+        ln = math.sqrt(nx*nx + ny*ny + nz*nz)
+        if ln < 1e-12:
+            nx, ny, nz = 0.0, 1.0, 0.0
+        else:
+            nx, ny, nz = nx/ln, ny/ln, nz/ln
+        t = acc_t[i]
+        d = t[0]*nx + t[1]*ny + t[2]*nz
+        tx, ty, tz = t[0]-nx*d, t[1]-ny*d, t[2]-nz*d
+        lt = math.sqrt(tx*tx + ty*ty + tz*tz)
+        if lt < 1e-12:
+            # no UV gradient: any direction perpendicular to the normal
+            ax = (1.0, 0.0, 0.0) if abs(nx) < 0.9 else (0.0, 0.0, 1.0)
+            d = ax[0]*nx + ax[1]*ny + ax[2]*nz
+            tx, ty, tz = ax[0]-nx*d, ax[1]-ny*d, ax[2]-nz*d
+            lt = math.sqrt(tx*tx + ty*ty + tz*tz)
+        tx, ty, tz = tx/lt, ty/lt, tz/lt
+        # bitangent: dP/dv in the surface plane, NOT forced perpendicular to the
+        # tangent (vanilla stores it that way; its normal maps are baked for it)
+        s = acc_b[i]
+        d = s[0]*nx + s[1]*ny + s[2]*nz
+        bx, by, bz = s[0]-nx*d, s[1]-ny*d, s[2]-nz*d
+        lb = math.sqrt(bx*bx + by*by + bz*bz)
+        if lb > 1e-12 and abs((bx*tx + by*ty + bz*tz) / lb) < 0.999:
+            bx, by, bz = bx/lb, by/lb, bz/lb
+        else:
+            # no usable dP/dv: n x t, signed to follow it when there is one
+            bx, by, bz = ny*tz - nz*ty, nz*tx - nx*tz, nx*ty - ny*tx
+            if bx*s[0] + by*s[1] + bz*s[2] < 0:
+                bx, by, bz = -bx, -by, -bz
+        frames.append(((tx, ty, tz), (bx, by, bz)))
+    return frames
 
 
 # COORDINATE TRANSFORMS
@@ -528,17 +648,43 @@ def invert_4x4(m):
         return None
 
 
+def crash_loop_position_keys(crash_obj, crash_mesh, inv_scale, fo2_mesh_matrix_inv=None):
+    """Per-loop crash position in FO2 (local) space, rounded to 0.1 mm, for the
+    vertex key. Same transform the crash.dat writer applies, so a key and the
+    crash position later written for that vertex always agree."""
+    M = fo2_mesh_matrix_inv
+    mw = crash_obj.matrix_world
+    per_vert = []
+    for v in crash_mesh.vertices:
+        p = blender_to_fo2_pos(mw @ v.co, inv_scale)
+        if M:
+            px, py, pz = p
+            p = (M[0][0]*px + M[0][1]*py + M[0][2]*pz + M[0][3],
+                 M[1][0]*px + M[1][1]*py + M[1][2]*pz + M[1][3],
+                 M[2][0]*px + M[2][1]*py + M[2][2]*pz + M[2][3])
+        per_vert.append((round(p[0], 4), round(p[1], 4), round(p[2], 4)))
+    lv = [0] * len(crash_mesh.loops)
+    crash_mesh.loops.foreach_get("vertex_index", lv)
+    return [per_vert[vi] for vi in lv]
+
+
 def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                                inv_scale, buf_id_start,
                                fo2_mesh_matrix_inv=None,
                                mesh_override=None,
-                               is_fouc=False):
+                               is_fouc=False,
+                               crash_loop_keys=None):
     """Build a vertex buffer and index buffer for all faces of `mat_index` on the given Blender mesh object.
 
     If fo2_mesh_matrix_inv is provided (4x4 list-of-lists), positions and 
     normals are transformed from FO2 world space to FO2 local space.
 
-    Returns (FO2VertexBuffer, FO2IndexBuffer, vertex_count, poly_count) or None if no faces.
+    crash_loop_keys (from crash_loop_position_keys, only when the crash mesh
+    matches loop for loop) adds each corner's crash position to the vertex key.
+
+    Returns (FO2VertexBuffer, FO2IndexBuffer, vertex_count, poly_count, blender_vis,
+    fouc_frame_src) or None if no faces. fouc_frame_src is (normals, uvs, tris) per
+    exported vertex for FOUC (crash tangents), None otherwise.
     """
     mesh = mesh_override if mesh_override is not None else obj.data
     mat_world = obj.matrix_world
@@ -583,11 +729,15 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
     unique_verts = []
     indices = []
 
+    # round for dedup key (avoid float precision issues)
+    def _r(v, d=6): return tuple(round(x, d) for x in v)
+
     for poly in faces:
         if len(poly.loop_indices) != 3:
             continue  # skip non-tris (shouldn't happen if triangulated)
 
         face_indices = []
+        corners = []
         for loop_idx in poly.loop_indices:
             loop = mesh.loops[loop_idx]
             vi = loop.vertex_index
@@ -667,10 +817,24 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                 except (IndexError, AttributeError):
                     pass
 
-            # round for dedup key (avoid float precision issues)
-            def _r(v, d=6): return tuple(round(x, d) for x in v)
+            corners.append((fo2_pos, fo2_nrm, fo2_uv, fo2_color, vi, loop_idx))
 
+        # FOUC: corners on opposite sides of a UV mirror (or the two faces of
+        # two-sided geometry) get separate vertices, their tangent frames differ
+        if is_fouc:
+            sides = [_fouc_corner_side(corners[0][0], corners[1][0], corners[2][0],
+                                       corners[0][2], corners[1][2], corners[2][2], c[1])
+                     for c in corners]
+        else:
+            sides = (None, None, None)
+
+        for (fo2_pos, fo2_nrm, fo2_uv, fo2_color, vi, loop_idx), side in zip(corners, sides):
             key = (_r(fo2_pos), _r(fo2_nrm), _r(fo2_uv), fo2_color)
+            if side is not None:
+                key += (side,)
+            if crash_loop_keys is not None:
+                # same base data, different crash target -> separate vertex
+                key += (crash_loop_keys[loop_idx],)
 
             if key not in vert_map:
                 vert_map[key] = len(unique_verts)
@@ -692,13 +856,25 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
         print(f"[BGM Export] WARNING: {obj.name} material slot {mat_index} "
               f"has {vertex_count} vertices (max 65535)!")
 
+    # FOUC tangent frames (need the whole triangle list); the same normals/UVs/
+    # triangles are handed back so crash.dat can get frames for the crashed shape
+    fouc_frames = None
+    fouc_frame_src = None
+    if is_fouc:
+        f_nrms = [u[1] for u in unique_verts]
+        f_uvs = [u[2] for u in unique_verts]
+        f_tris = [tuple(indices[i:i + 3]) for i in range(0, len(indices), 3)]
+        fouc_frames = compute_fouc_tangent_frames(
+            [u[0] for u in unique_verts], f_nrms, f_uvs, f_tris)
+        fouc_frame_src = (f_nrms, f_uvs, f_tris)
+
     # pack vertex data
     vdata = bytearray()
     blender_vis = []  # (bvi, loop_idx) for each unique vertex
-    for pos, nrm, uv, color, bvi, loop_idx in unique_verts:
+    for i, (pos, nrm, uv, color, bvi, loop_idx) in enumerate(unique_verts):
         blender_vis.append((bvi, loop_idx))
         if is_fouc:
-            vdata += pack_fouc_vertex(pos, nrm, uv)
+            vdata += pack_fouc_vertex(pos, nrm, uv, *fouc_frames[i])
         else:
             # position (3 floats, always present)
             vdata += struct.pack('<3f', *pos)
@@ -721,7 +897,7 @@ def build_buffers_for_material(obj, mat_index, flags, vertex_size,
                            vertex_count, bytes(vdata))
     ibuf = FO2IndexBuffer(buf_id_start + 1, len(indices), bytes(idata))
 
-    return vbuf, ibuf, vertex_count, poly_count, blender_vis
+    return vbuf, ibuf, vertex_count, poly_count, blender_vis, fouc_frame_src
 
 
 # BUILD FO2 MATERIAL FROM BLENDER MATERIAL
@@ -1298,8 +1474,30 @@ def write_bgm(filepath: str, context, options: dict):
         aabb_min = [1e9, 1e9, 1e9]
         aabb_max = [-1e9, -1e9, -1e9]
 
+        # crash correspondence is settled BEFORE the buffers are built: when the
+        # crash mesh matches loop for loop, every corner's crash position joins
+        # the vertex key, so corners that share all base data but deform apart
+        # (crash tears) stay separate vertices instead of one losing its target
+        model_name = re.sub(r'\.\d{3}$', '', obj.name)
+        crash_obj = crash_mesh_map.get(model_name)
+        crash_ctx = None
+        crash_loop_keys = None
+        if crash_obj:
+            crash_work_mesh, crash_is_temp, crash_how, loop_order_safe = \
+                build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate)
+            if crash_is_temp:
+                temp_meshes.append(crash_work_mesh)
+            # make sure the crash mesh's split (loop) normals are available
+            # these carry the deformation and are read per-vertex
+            if hasattr(crash_work_mesh, 'calc_normals_split'):
+                crash_work_mesh.calc_normals_split()
+            crash_ctx = (crash_work_mesh, crash_how, loop_order_safe)
+            if loop_order_safe and len(crash_work_mesh.loops) == len(work_mesh.loops):
+                crash_loop_keys = crash_loop_position_keys(
+                    crash_obj, crash_work_mesh, inv_scale, fo2_mesh_matrix_inv)
+
         # track per-surface info for crash matching:
-        # list of (mat_idx, flags, vsize, base_vbuf_data, vert_count)
+        # list of (mat_idx, flags, vsize, base_vbuf_data, vert_count, blender_vis, fouc_frame_src)
         surface_build_info = []
 
         for mat_idx in mat_slots:
@@ -1315,11 +1513,12 @@ def write_bgm(filepath: str, context, options: dict):
                 obj, mat_idx, flags, vsize, inv_scale, stream_id_counter,
                 fo2_mesh_matrix_inv=fo2_mesh_matrix_inv,
                 mesh_override=work_mesh,
-                is_fouc=is_fouc)
+                is_fouc=is_fouc,
+                crash_loop_keys=crash_loop_keys)
             if not result:
                 continue
 
-            vbuf, ibuf, vert_count, poly_count, blender_vis = result
+            vbuf, ibuf, vert_count, poly_count, blender_vis, fouc_frame_src = result
             vbuf.fouc_extra = 22 if is_fouc else 0
 
             # create surface
@@ -1377,7 +1576,8 @@ def write_bgm(filepath: str, context, options: dict):
             fo2_surfaces.append(surface)
             fo2_vbufs.append(vbuf)
             fo2_ibufs.append(ibuf)
-            surface_build_info.append((mat_idx, flags, vsize, vbuf.data, vert_count, blender_vis))
+            surface_build_info.append((mat_idx, flags, vsize, vbuf.data, vert_count, blender_vis,
+                                       fouc_frame_src))
             stream_id_counter += 2
 
         # finalize model AABB
@@ -1394,19 +1594,10 @@ def write_bgm(filepath: str, context, options: dict):
             ]
             model.f_radius = math.sqrt(sum(r * r for r in model.radius))
 
-            # build crash data if matching crash mesh exists
-            model_name = re.sub(r'\.\d{3}$', '', obj.name)
-            crash_obj = crash_mesh_map.get(model_name)
-            if crash_obj and surface_build_info:
-                crash_work_mesh, crash_is_temp, crash_how, loop_order_safe = \
-                    build_crash_work_mesh(obj, work_mesh, crash_obj, auto_triangulate)
-                if crash_is_temp:
-                    temp_meshes.append(crash_work_mesh)
-
-                # make sure the crash mesh's split (loop) normals are available
-                # these carry the deformation and are read per-vertex
-                if hasattr(crash_work_mesh, 'calc_normals_split'):
-                    crash_work_mesh.calc_normals_split()
+            # build crash data if matching crash mesh exists (correspondence
+            # was settled before the buffers were built, see crash_ctx)
+            if crash_ctx is not None and surface_build_info:
+                crash_work_mesh, crash_how, loop_order_safe = crash_ctx
 
                 crash_mat_world = crash_obj.matrix_world
                 crash_verts = crash_work_mesh.vertices
@@ -1440,8 +1631,11 @@ def write_bgm(filepath: str, context, options: dict):
                     # FOUC uint8 normal encode: matches pack_fouc_vertex / decode (v/127 - 1)
                     return max(0, min(255, int(round((v + 1.0) * 127.0))))
 
-                for base_mat_idx, flags, vsize, base_vdata, base_vcount, blender_vis in surface_build_info:
+                for (base_mat_idx, flags, vsize, base_vdata, base_vcount, blender_vis,
+                     fouc_frame_src) in surface_build_info:
                     crash_vdata = bytearray(base_vdata)
+                    crash_positions = []   # FOUC: crashed shape, for its tangent frames
+                    crash_normals = []
                     surf_has_normal = is_fouc or bool(flags & VERTEX_NORMAL)
 
                     for buf_idx, (bvi, loop_idx) in enumerate(blender_vis):
@@ -1499,11 +1693,27 @@ def write_bgm(filepath: str, context, options: dict):
                                 crash_vdata[off + 16] = _enc_cn(fo2_cn[2])
                                 crash_vdata[off + 17] = _enc_cn(fo2_cn[1])
                                 crash_vdata[off + 18] = _enc_cn(fo2_cn[0])
+                            if fouc_frame_src is not None:
+                                crash_positions.append(crash_pos)
+                                crash_normals.append(fo2_cn if fo2_cn is not None
+                                                     else fouc_frame_src[0][buf_idx])
                         else:
                             struct.pack_into('<3f', crash_vdata, off, *crash_pos)
                             if fo2_cn is not None:
                                 # float normal directly after the 12-byte position
                                 struct.pack_into('<3f', crash_vdata, off + 12, *fo2_cn)
+
+                    # FOUC: crash.dat stores a tangent frame for the crashed shape
+                    # too (vanilla recomputes it from the deformed geometry with the
+                    # base UVs); write_crash_dat reads it from crash_vdata[8:16]
+                    if fouc_frame_src is not None and len(crash_positions) == base_vcount:
+                        crash_frames = compute_fouc_tangent_frames(
+                            crash_positions, crash_normals,
+                            fouc_frame_src[1], fouc_frame_src[2])
+                        for buf_idx, (ct, cb) in enumerate(crash_frames):
+                            off = buf_idx * vsize
+                            crash_vdata[off + 8:off + 12] = bytes(_enc_fouc_dir(ct))
+                            crash_vdata[off + 12:off + 16] = bytes(_enc_fouc_dir(cb))
 
                     crash_surfaces.append((base_vdata, bytes(crash_vdata), vsize,
                                            base_vcount, flags))
