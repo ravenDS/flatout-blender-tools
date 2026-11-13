@@ -955,6 +955,78 @@ def _apply_custom_normals(mesh, vert_normals):
     )
 
 
+def _vertex_identity_key(v, crash_v=None):
+    """Exact (unrounded) tuple of everything the importer takes from one vertex
+    + its crash position/normal when the surface has crash data
+
+    Two VB entries with equal keys are indistinguishable in Blender
+    they only differ in bytes importer never read (FOUC tangent/bitangent, pad, UV2).
+    """
+    k = (v.x, v.y, v.z, v.has_normal, v.nx, v.ny, v.nz,
+         v.has_uv, v.u, v.v, v.has_color, v.r, v.g, v.b, v.a)
+    if crash_v is not None:
+        k += (crash_v.x, crash_v.y, crash_v.z, crash_v.nx, crash_v.ny, crash_v.nz,
+              crash_v.has_uv, crash_v.u, crash_v.v)
+    return k
+
+
+def _collapse_duplicate_records(verts, faces, base_vertex_offset, crash_verts=None):
+    """Map each local vertex of ONE surface to a representative VB entry.
+
+    FOUC vertex buffers split vertices on tangent/bitangent, 
+    which the importer discards: those entries are byte-identical in
+    position, normal, UV, colour and crash data, yet a pure (stream, index)
+    identity leaves them as separate Blender vertices, so the mesh comes in
+    torn apart.  Entries whose _vertex_identity_key is equal are therefore the
+    same vertex as far as Blender is concerned and resolve to the first one.
+
+    This is NOT a weld by decoded position: the key is exact and covers every
+    imported attribute, so UV seams, hard edges, colour seams and crash tears
+    all keep their separate vertices.  It is scoped to one surface, so
+    overlapping geometry from different surfaces is never merged.  A merge
+    is also refused whenever it would make a face degenerate, or give it the
+    same vertex set as another face of the surface (e.g. the two sides of
+    two-sided geometry, whose records differ only by a mirrored tangent):
+    Blender's validate() deletes such faces.
+
+    Returns canon: list, canon[local_vi] = local index of the representative.
+    """
+    n = len(verts)
+    canon = list(range(n))
+    first = {}
+    for vi, v in enumerate(verts):
+        cv = crash_verts[vi] if crash_verts is not None else None
+        canon[vi] = first.setdefault(_vertex_identity_key(v, cv), vi)
+
+    local_faces = []
+    for i0, i1, i2 in faces:
+        l = (i0 - base_vertex_offset, i1 - base_vertex_offset, i2 - base_vertex_offset)
+        if all(0 <= x < n for x in l) and len(set(l)) == 3:
+            local_faces.append(l)
+
+    # undo any merge that would collapse or duplicate a face
+    # repeat until stable (un-merging only ever moves back toward the source topology)
+    while True:
+        seen = {}       # sorted representative triple -> sorted source triple
+        changed = False
+        for l in local_faces:
+            c = (canon[l[0]], canon[l[1]], canon[l[2]])
+            if c[0] == c[1] or c[1] == c[2] or c[0] == c[2]:
+                bad = True
+            else:
+                ck = tuple(sorted(c))
+                src = tuple(sorted(l))
+                prev = seen.setdefault(ck, src)
+                bad = prev != src
+            if bad:
+                for x in l:
+                    if canon[x] != x:
+                        canon[x] = x
+                        changed = True
+        if not changed:
+            return canon
+
+
 def build_blender_meshes(context, parser: BGMParser, options: dict):
     """Build Blender mesh objects from parsed BGM data."""
 
@@ -1181,7 +1253,20 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
         #
         # Do not weld by decoded values here. Besides erasing that identity, rounded
         # position/normal keys can merge merely-near vertices and can collapse faces.
+        #
+        # Exception (see _collapse_duplicate_records): within one surface, VB
+        # entries that are exactly identical in every imported attribute (and
+        # crash data) are one vertex — FOUC splits them on tangent bytes only.
         abs_stream_idx_to_vert = {}   # (stream_id, abs_vb_idx) -> bl_vi
+
+        # crash vertices per surface (extracted once, reused by the crash mesh)
+        # and the per-surface representative map shared by base and crash
+        # meshes, so both keep the same vertex/face topology
+        crash_verts_by_surf = {}
+        for _bs, _cs in crash_surface_pairs:
+            if _cs.vertex_count == _bs.vertex_count:
+                crash_verts_by_surf[id(_bs)] = extract_crash_vertices(_cs, _bs.flags)
+        canon_by_surf = {}
 
         for surf in surfaces:
             vb = parser.vertex_buffers[surf.stream_id[0]]
@@ -1208,12 +1293,24 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
             has_uvs = any(v.has_uv for v in verts)
             has_colors = any(v.has_color for v in verts)
 
+            crash_verts = crash_verts_by_surf.get(id(surf))
+            if crash_verts is not None and len(crash_verts) != len(verts):
+                crash_verts = None
+            canon = _collapse_duplicate_records(verts, faces, base_vertex_offset, crash_verts)
+            canon_by_surf[id(surf)] = canon
+
             local_to_blender = {}  # local surface vert index -> index in all_verts
             for vi, v in enumerate(verts):
-                # exact VB index match only
+                # exact VB index match (an entry another surface already mapped)
                 abs_key = (surf.stream_id[0], base_vertex_offset + vi)
                 if abs_key in abs_stream_idx_to_vert:
                     local_to_blender[vi] = abs_stream_idx_to_vert[abs_key]
+                    continue
+                # identical record earlier in this surface -> same vertex
+                if canon[vi] != vi:
+                    bl_vi = local_to_blender[canon[vi]]
+                    abs_stream_idx_to_vert[abs_key] = bl_vi
+                    local_to_blender[vi] = bl_vi
                     continue
 
                 # New vertex
@@ -1419,7 +1516,6 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
             crash_all_face_mat_indices = []
             crash_mat_index_map = {}
             crash_mesh_materials = []
-            crash_vert_offset = 0
 
             for bgm_surf, crash_surf in crash_surface_pairs:
                 # validate vertex counts match
@@ -1428,7 +1524,9 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     continue
 
                 # extract crash vertices (crash positions/normals + UVs from buffer)
-                verts = extract_crash_vertices(crash_surf, bgm_surf.flags)
+                verts = crash_verts_by_surf.get(id(bgm_surf))
+                if verts is None:
+                    verts = extract_crash_vertices(crash_surf, bgm_surf.flags)
                 if not verts:
                     continue
                 faces = extract_indices(parser, bgm_surf)
@@ -1445,8 +1543,18 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     crash_mesh_materials.append(blender_materials.get(mat_id))
                 local_mat_idx = crash_mat_index_map[mat_id]
 
+                # same representative map as the base mesh -> identical topology
+                canon = canon_by_surf.get(id(bgm_surf))
+                if canon is None or len(canon) != len(verts):
+                    canon = list(range(len(verts)))
+                local_to_crash = [0] * len(verts)
+
                 # transform crash vertices (same coordinate conversion as base)
-                for v in verts:
+                for vi, v in enumerate(verts):
+                    if canon[vi] != vi:
+                        local_to_crash[vi] = local_to_crash[canon[vi]]
+                        continue
+                    local_to_crash[vi] = len(crash_all_verts)
                     pos = Vector((v.x, v.y, v.z))
                     if not use_origins:
                         pos = mesh_matrix @ pos
@@ -1474,16 +1582,13 @@ def build_blender_meshes(context, parser: BGMParser, options: dict):
                     fi2 = i2 - base_vertex_offset
                     if not (0 <= fi0 < len(verts) and 0 <= fi1 < len(verts) and 0 <= fi2 < len(verts)):
                         continue
-                    if fi0 == fi1 or fi1 == fi2 or fi0 == fi2:
+                    c0 = local_to_crash[fi0]
+                    c1 = local_to_crash[fi1]
+                    c2 = local_to_crash[fi2]
+                    if c0 == c1 or c1 == c2 or c0 == c2:
                         continue
-                    crash_all_faces.append((
-                        crash_vert_offset + fi0,
-                        crash_vert_offset + fi1,
-                        crash_vert_offset + fi2,
-                    ))
+                    crash_all_faces.append((c0, c1, c2))
                     crash_all_face_mat_indices.append(local_mat_idx)
-
-                crash_vert_offset += len(verts)
 
             if crash_all_faces:
                 crash_mesh_name = mesh_name + "_crash"
