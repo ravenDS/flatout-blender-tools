@@ -957,10 +957,10 @@ def _apply_custom_normals(mesh, vert_normals):
 
 def _vertex_identity_key(v, crash_v=None):
     """Exact (unrounded) tuple of everything the importer takes from one vertex
-    + its crash position/normal when the surface has crash data
+    record, plus its crash position/normal when the surface has crash data.
 
-    Two VB entries with equal keys are indistinguishable in Blender
-    they only differ in bytes importer never read (FOUC tangent/bitangent, pad, UV2).
+    Two VB entries with equal keys are indistinguishable in Blender: they only
+    differ in bytes the importer never reads (FOUC tangent/bitangent, pad, UV2).
     """
     k = (v.x, v.y, v.z, v.has_normal, v.nx, v.ny, v.nz,
          v.has_uv, v.u, v.v, v.has_color, v.r, v.g, v.b, v.a)
@@ -973,8 +973,8 @@ def _vertex_identity_key(v, crash_v=None):
 def _collapse_duplicate_records(verts, faces, base_vertex_offset, crash_verts=None):
     """Map each local vertex of ONE surface to a representative VB entry.
 
-    FOUC vertex buffers split vertices on tangent/bitangent, 
-    which the importer discards: those entries are byte-identical in
+    FOUC vertex buffers split vertices on tangent/bitangent (normal-map tangent
+    seams), which the importer discards: those entries are byte-identical in
     position, normal, UV, colour and crash data, yet a pure (stream, index)
     identity leaves them as separate Blender vertices, so the mesh comes in
     torn apart.  Entries whose _vertex_identity_key is equal are therefore the
@@ -987,25 +987,51 @@ def _collapse_duplicate_records(verts, faces, base_vertex_offset, crash_verts=No
     is also refused whenever it would make a face degenerate, or give it the
     same vertex set as another face of the surface (e.g. the two sides of
     two-sided geometry, whose records differ only by a mirrored tangent):
-    Blender's validate() deletes such faces.
+    Blender's validate() deletes such faces.  Records are also never merged
+    across faces wound in opposite directions relative to the vertex normal
+    (e.g. reversed-winding triangles): Blender splits such a vertex into
+    separate smoothing fans and could not keep its custom normal on all of them.
 
     Returns canon: list, canon[local_vi] = local index of the representative.
     """
     n = len(verts)
-    canon = list(range(n))
-    first = {}
-    for vi, v in enumerate(verts):
-        cv = crash_verts[vi] if crash_verts is not None else None
-        canon[vi] = first.setdefault(_vertex_identity_key(v, cv), vi)
-
     local_faces = []
     for i0, i1, i2 in faces:
         l = (i0 - base_vertex_offset, i1 - base_vertex_offset, i2 - base_vertex_offset)
         if all(0 <= x < n for x in l) and len(set(l)) == 3:
             local_faces.append(l)
 
-    # undo any merge that would collapse or duplicate a face
-    # repeat until stable (un-merging only ever moves back toward the source topology)
+    # which way each record's faces turn relative to its normal: +1 all agree
+    # with it, -1 all oppose it (reversed winding), 0 mixed. Records are only
+    # merged within the same orientation: a vertex shared by faces wound both
+    # ways is split by Blender into separate smoothing fans and the per-vertex
+    # custom normal then can't be held for every corner.
+    orient = [None] * n
+    for a, b, c in local_faces:
+        va, vb, vc = verts[a], verts[b], verts[c]
+        e1 = (vb.x - va.x, vb.y - va.y, vb.z - va.z)
+        e2 = (vc.x - va.x, vc.y - va.y, vc.z - va.z)
+        gx = e1[1]*e2[2] - e1[2]*e2[1]
+        gy = e1[2]*e2[0] - e1[0]*e2[2]
+        gz = e1[0]*e2[1] - e1[1]*e2[0]
+        for x in (a, b, c):
+            v = verts[x]
+            s = 1 if gx*v.nx + gy*v.ny + gz*v.nz >= 0 else -1
+            if orient[x] is None:
+                orient[x] = s
+            elif orient[x] != s:
+                orient[x] = 0
+
+    canon = list(range(n))
+    first = {}
+    for vi, v in enumerate(verts):
+        if orient[vi] == 0:
+            continue            # already mixed in the source: never merged
+        cv = crash_verts[vi] if crash_verts is not None else None
+        canon[vi] = first.setdefault((_vertex_identity_key(v, cv), orient[vi]), vi)
+
+    # undo any merge that would collapse or duplicate a face; repeat until
+    # stable (un-merging only ever moves back toward the source topology)
     while True:
         seen = {}       # sorted representative triple -> sorted source triple
         changed = False
